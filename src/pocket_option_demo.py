@@ -289,9 +289,9 @@ class PocketOptionDemoExecutor(TradeExecutor):
             
             status = "UNKNOWN"
             if actual_profit is not None:
-                if actual_profit == 0.0:
+                if float(actual_profit) <= 0.0:
                     status = "LOSS"
-                elif actual_profit > 0.0:
+                elif float(actual_profit) > 0.0:
                     status = "WIN"
             
             if status == "LOSS":

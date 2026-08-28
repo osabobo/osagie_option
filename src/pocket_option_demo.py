@@ -253,6 +253,7 @@ class PocketOptionDemoExecutor(TradeExecutor):
         # Poll loop: wait for the close_event from the websocket.
         elapsed = 0
         poll_interval = 2
+        last_fallback_check = -999
         while elapsed < timeout:
             if custom_close_event.is_set():
                 break
@@ -268,14 +269,17 @@ class PocketOptionDemoExecutor(TradeExecutor):
                 except Exception as e:
                     print(f"[TRADE-RESULT] Reconnect failed: {e}")
             
-            # Check deals_storage fallback, but only consider it closed if we have a real close_price
-            # deal.closed is True even for open deals because close_timestamp is pre-populated!
-            deal = await self.deals_storage.get_deal(deal_id=deal_uuid)
-            if deal and getattr(deal, 'close_price', 0.0) not in (0.0, None):
-                print(f"[TRADE-RESULT] Deal {trade_id} found fully closed in deals_storage fallback.")
-                if unsub:
-                    unsub()
-                return _make_result(deal)
+            # Rate-limit fallback history requests to prevent server spam (check every 15s)
+            if elapsed - last_fallback_check >= 15:
+                last_fallback_check = elapsed
+                # Check deals_storage fallback, but only consider it closed if we have a real close_price
+                # deal.closed is True even for open deals because close_timestamp is pre-populated!
+                deal = await self.deals_storage.get_deal(deal_id=deal_uuid)
+                if deal and getattr(deal, 'close_price', 0.0) not in (0.0, None):
+                    print(f"[TRADE-RESULT] Deal {trade_id} found fully closed in deals_storage fallback.")
+                    if unsub:
+                        unsub()
+                    return _make_result(deal)
 
             await asyncio.sleep(poll_interval)
             elapsed += poll_interval

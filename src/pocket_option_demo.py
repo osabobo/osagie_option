@@ -197,8 +197,14 @@ class PocketOptionDemoExecutor(TradeExecutor):
 
         # Merge old deals into the new storage so we don't lose history
         if old_storage and hasattr(old_storage, '_deals'):
-            for deal_id, deal in old_storage._deals.items():
-                new_storage._deals[deal_id] = deal
+            if isinstance(old_storage._deals, dict):
+                for deal_id, deal in old_storage._deals.items():
+                    new_storage._deals[deal_id] = deal
+            elif isinstance(old_storage._deals, list):
+                existing_ids = {getattr(d, 'id', None) for d in getattr(new_storage, '_deals', [])}
+                for deal in old_storage._deals:
+                    if getattr(deal, 'id', None) not in existing_ids:
+                        new_storage._deals.append(deal)
         
         self.deals_storage = new_storage
 

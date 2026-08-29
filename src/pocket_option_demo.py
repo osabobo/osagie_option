@@ -15,6 +15,8 @@ class PocketOptionDemoExecutor(TradeExecutor):
         self.platform = os.getenv("POCKET_OPTION_PLATFORM", "1")
         self.client = None
         self.deals_storage = None
+        # Track pending close-deal listeners so reconnect() can re-register them
+        self._pending_close_listeners = []
 
     async def connect(self):
         await self._try_connect()
@@ -112,6 +114,110 @@ class PocketOptionDemoExecutor(TradeExecutor):
                 print("[WARNING] Authorization failed - continuing anyway, trades may fail.")
         
         self.deals_storage = MemoryDealsStorage(self.client)
+
+        # Re-register any pending close-deal listeners that were set up before
+        # a disconnect interrupted get_trade_result().
+        self._reattach_close_listeners()
+
+    async def reconnect(self):
+        """Lightweight reconnect that preserves deals_storage state.
+        
+        Unlike connect(), this does NOT destroy the in-memory deal cache.
+        After reconnecting, it re-registers any pending close-deal listeners
+        and waits for the sync events (updateClosedDeals etc.) to arrive.
+        """
+        from pocket_option import PocketOptionClient
+        from pocket_option.models import AuthorizationData
+        from pocket_option.constants import Regions
+        from pocket_option.contrib.deals import MemoryDealsStorage
+
+        old_storage = self.deals_storage
+
+        # Gracefully disconnect the old socket if still alive
+        if self.client:
+            try:
+                await self.client.disconnect()
+            except Exception:
+                pass
+
+        # Build a fresh client
+        self.client = PocketOptionClient(
+            logger=True,
+            socketio_logger=True,
+            engineio_logger=True,
+        )
+        auth_data = AuthorizationData(
+            session=self.ssid,
+            uid=int(self.uid) if self.uid else 0,
+            isDemo=(os.getenv("TRADING_MODE", "demo").lower() == "demo"),
+            isFastHistory=True,
+            isOptimized=True,
+            platform=int(self.platform) if self.platform else 2,
+        )
+        headers = {
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/151.0.0.0 Safari/537.36",
+            "Origin": "https://pocketoption.com"
+        }
+        trading_mode = os.getenv("TRADING_MODE", "demo").lower()
+        ws_url = Regions.EUROPA.value if trading_mode == "live" else Regions.DEMO.value
+
+        await self.client.connect(
+            url=ws_url,
+            auth=None,
+            headers=headers
+        )
+
+        async def on_auth_success(*args):
+            self.client.authorized_event.set()
+        self.client.add_on("auth/success", on_auth_success)
+        self.client.add_on("user_ready", on_auth_success)
+
+        self.client.authorization_data = auth_data
+        await self.client.send("auth", auth_data)
+
+        print("[RECONNECT] Waiting for broker authorization...")
+        authorized = False
+        for _ in range(30):
+            if self.client.authorized_event.is_set():
+                authorized = True
+                break
+            if not self.client.sio.connected:
+                print("[RECONNECT] Socket disconnected while waiting for authorization.")
+                break
+            await asyncio.sleep(0.5)
+
+        if authorized:
+            print("[RECONNECT] Broker authorized and ready!")
+        else:
+            print("[RECONNECT] Authorization failed after reconnect.")
+
+        # Reattach deals storage to the NEW client so it receives new events,
+        # but preserve the old deal cache from the previous connection.
+        new_storage = MemoryDealsStorage(self.client)
+
+        # Merge old deals into the new storage so we don't lose history
+        if old_storage and hasattr(old_storage, '_deals'):
+            for deal_id, deal in old_storage._deals.items():
+                new_storage._deals[deal_id] = deal
+        
+        self.deals_storage = new_storage
+
+        # Re-register any pending close-deal listeners on the new client
+        self._reattach_close_listeners()
+
+        # Give time for updateClosedDeals sync events to arrive
+        await asyncio.sleep(5)
+
+    def _reattach_close_listeners(self):
+        """Re-register all pending close-deal event listeners on the current client."""
+        for listener_info in self._pending_close_listeners:
+            callback = listener_info['callback']
+            try:
+                unsub = self.client.on.success_close_deal(callback)
+                listener_info['unsub'] = unsub
+                print(f"[RECONNECT] Re-registered close-deal listener for {listener_info.get('trade_id', '?')}")
+            except Exception as e:
+                print(f"[RECONNECT] Failed to re-register close-deal listener: {e}")
 
     def _resolve_asset(self, asset_str: str):
         """Map a signal asset string like 'USDCHF-OTC' to the SDK's Asset enum."""
@@ -247,8 +353,17 @@ class PocketOptionDemoExecutor(TradeExecutor):
                     actual_profit = event.profit
                     custom_close_event.set()
         
-        # Subscribe to the event
+        # Subscribe to the event and track it for reconnect re-registration
         unsub = self.client.on.success_close_deal(on_close_deal)
+
+        listener_info = {
+            'callback': on_close_deal,
+            'unsub': unsub,
+            'trade_id': trade_id,
+        }
+        self._pending_close_listeners.append(listener_info)
+
+        reconnect_count = 0
         
         # Poll loop: wait for the close_event from the websocket.
         elapsed = 0
@@ -258,14 +373,21 @@ class PocketOptionDemoExecutor(TradeExecutor):
             if custom_close_event.is_set():
                 break
                 
-            # If socket drops, try to reconnect to trigger updateClosedDeals sync
+            # If socket drops, use reconnect() to preserve state and re-register listeners
             if self.client and not getattr(self.client.sio, 'connected', True):
-                print(f"[TRADE-RESULT] Socket disconnected for {trade_id}. Attempting reconnect...")
+                reconnect_count += 1
+                print(f"[TRADE-RESULT] Socket disconnected for {trade_id}. Attempting reconnect #{reconnect_count}...")
                 try:
-                    await self.connect()
-                    # After reconnect, wait a bit for sync events to process
-                    await asyncio.sleep(5)
+                    await self.reconnect()
+                    # reconnect() already waits 5s for sync events
                     elapsed += 5
+
+                    # After reconnect, immediately check if the deal closed while we were disconnected
+                    deal = await self.deals_storage.get_deal(deal_id=deal_uuid)
+                    if deal and getattr(deal, 'close_price', 0.0) not in (0.0, None):
+                        print(f"[TRADE-RESULT] Deal {trade_id} found closed after reconnect sync!")
+                        self._cleanup_listener(listener_info)
+                        return _make_result(deal)
                 except Exception as e:
                     print(f"[TRADE-RESULT] Reconnect failed: {e}")
             
@@ -277,16 +399,14 @@ class PocketOptionDemoExecutor(TradeExecutor):
                 deal = await self.deals_storage.get_deal(deal_id=deal_uuid)
                 if deal and getattr(deal, 'close_price', 0.0) not in (0.0, None):
                     print(f"[TRADE-RESULT] Deal {trade_id} found fully closed in deals_storage fallback.")
-                    if unsub:
-                        unsub()
+                    self._cleanup_listener(listener_info)
                     return _make_result(deal)
 
             await asyncio.sleep(poll_interval)
             elapsed += poll_interval
         
-        # Unsubscribe
-        if unsub:
-            unsub()
+        # Clean up the listener tracking
+        self._cleanup_listener(listener_info)
             
         if custom_close_event.is_set():
             deal = await self.deals_storage.get_deal(deal_id=deal_uuid)
@@ -301,9 +421,6 @@ class PocketOptionDemoExecutor(TradeExecutor):
             if status == "LOSS":
                 pnl = -float(deal.amount)
             elif status == "WIN":
-                pnl = float(actual_profit) - float(deal.amount) # Realized net profit (or just use actual_profit if it's the net. Let's assume actual_profit is total payout, so net = payout - stake. Wait! PocketOption usually sends net profit or total payout? Actually the user said 'payout'. If $10 yields $19.2, net is $9.2. Let's just use float(actual_profit) for now or expected_profit.)
-                # Wait, if expected_profit = 9.2 (net), and actual_profit = 19.2 (gross), I should use expected_profit for WIN.
-                # Let's just use expected_profit if WIN, -deal.amount if LOSS.
                 pnl = float(getattr(deal, 'profit', 0.0))
             else:
                 pnl = 0.0
@@ -317,19 +434,47 @@ class PocketOptionDemoExecutor(TradeExecutor):
                 pnl=pnl,
             )
         
-        # If we're here, either the socket died or we timed out. We MUST NOT default to LOSS!
-        # If we blindly return LOSS, it causes runaway Martingale trades on network issues.
-        # As a final resort, check deals_storage one last time.
+        # ── Last-resort recovery: reconnect up to 3 more times and check ──
+        # This handles the scenario where the socket died right as the deal closed,
+        # and the sync events were missed even after the in-loop reconnect.
+        print(f"[TRADE-RESULT] Primary poll timed out for {trade_id}. Starting last-resort recovery...")
+        for attempt in range(1, 4):
+            print(f"[TRADE-RESULT] Last-resort attempt {attempt}/3: reconnecting...")
+            try:
+                await self.reconnect()
+                # Wait extra time for updateClosedDeals to arrive
+                await asyncio.sleep(8)
+
+                deal = await self.deals_storage.get_deal(deal_id=deal_uuid)
+                if deal and getattr(deal, 'close_price', 0.0) not in (0.0, None):
+                    print(f"[TRADE-RESULT] Deal {trade_id} found closed on last-resort attempt {attempt}!")
+                    return _make_result(deal)
+            except Exception as e:
+                print(f"[TRADE-RESULT] Last-resort reconnect attempt {attempt} failed: {e}")
+            
+            await asyncio.sleep(3)
+        
+        # Absolute final check on deals_storage
         deal = await self.deals_storage.get_deal(deal_id=deal_uuid)
         if deal and getattr(deal, 'close_price', 0.0) not in (0.0, None):
-            print(f"[TRADE-RESULT] Deal {trade_id} found closed after timeout.")
+            print(f"[TRADE-RESULT] Deal {trade_id} found closed after all recovery attempts.")
             return _make_result(deal)
             
-        print(f"[TRADE-RESULT] WARNING: Could not determine result for {trade_id} (elapsed={elapsed}s). Returning UNKNOWN.")
+        print(f"[TRADE-RESULT] WARNING: Could not determine result for {trade_id} (elapsed={elapsed}s, reconnects={reconnect_count}). Returning UNKNOWN.")
         return TradeResult(
             accepted=True,
             trade_id=trade_id,
             status="UNKNOWN",
-            message=f"Result unknown (timeout or network error).",
+            message=f"Result unknown (timeout or network error after {reconnect_count} reconnects).",
         )
 
+    def _cleanup_listener(self, listener_info):
+        """Unsubscribe a close-deal listener and remove it from the pending list."""
+        try:
+            unsub = listener_info.get('unsub')
+            if unsub:
+                unsub()
+        except Exception:
+            pass
+        if listener_info in self._pending_close_listeners:
+            self._pending_close_listeners.remove(listener_info)

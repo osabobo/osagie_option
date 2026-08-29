@@ -110,6 +110,15 @@ async def execute_with_martingale(executor, risk, signal, max_martingale=2, mult
         check_result = await executor.get_trade_result(result.trade_id, timeout=timeout_seconds)
         print(f"[MARTINGALE] Result for {result.trade_id}: {check_result.status}")
         
+        # If result is UNKNOWN, retry once after a delay before giving up.
+        # This handles the case where a WebSocket reconnect was in progress
+        # and the result arrives a few seconds late.
+        if check_result.status == "UNKNOWN":
+            print(f"[MARTINGALE] Result UNKNOWN for {result.trade_id}. Retrying after 20s...")
+            await asyncio.sleep(20)
+            check_result = await executor.get_trade_result(result.trade_id, timeout=60)
+            print(f"[MARTINGALE] Retry result for {result.trade_id}: {check_result.status}")
+
         if check_result.status == "WIN":
             print(f"[MARTINGALE] Trade WON! Celebrating and stopping.")
             await log_trade_to_sheets(signal, "WIN", mg_count)

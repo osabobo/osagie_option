@@ -423,6 +423,8 @@ class PocketOptionDemoExecutor(TradeExecutor):
                     status = "LOSS"
                 elif float(actual_profit) > 0.0:
                     status = "WIN"
+            elif deal:
+                return _make_result(deal)
             
             if status == "LOSS":
                 pnl = -float(deal.amount)

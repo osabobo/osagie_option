@@ -297,13 +297,22 @@ async def main():
             print({"event": "signal_rejected", "reason": reason})
             return
         
+        # Determine max martingale steps:
+        # - Use signal.max_martingale as the primary source of truth
+        # - Cap it by settings.max_martingale_steps to respect the user's risk preference
+        # - If settings.allow_martingale is False, max_mg is forced to 0 (no martingale)
+        signal_max_mg = getattr(signal, 'max_martingale', 0) or 0
         if settings.allow_martingale:
-            max_mg = settings.max_martingale_steps
-            print(f"[MARTINGALE] Martingale ENABLED for {signal.asset} (expiry={signal.expiry_seconds}s, max_steps={max_mg})")
-            asyncio.create_task(execute_with_martingale(executor, risk, signal, max_martingale=max_mg))
+            max_mg = min(signal_max_mg, settings.max_martingale_steps)
+            if max_mg > 0:
+                print(f"[MARTINGALE] Martingale ENABLED for {signal.asset} (expiry={signal.expiry_seconds}s, signal_max={signal_max_mg}, settings_cap={settings.max_martingale_steps}, effective_max={max_mg})")
+            else:
+                print(f"[MARTINGALE] Signal has max_martingale=0. Placing single trade for {signal.asset}.")
         else:
-            print(f"[TRADE] Martingale disabled. Placing single trade for {signal.asset}.")
-            asyncio.create_task(execute_with_martingale(executor, risk, signal, max_martingale=0))
+            max_mg = 0
+            print(f"[TRADE] Martingale disabled by settings. Placing single trade for {signal.asset}.")
+        
+        asyncio.create_task(execute_with_martingale(executor, risk, signal, max_martingale=max_mg))
 
     await client.start()
     

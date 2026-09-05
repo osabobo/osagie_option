@@ -9,6 +9,20 @@ MG_RE = re.compile(r"(?:Max\s+|make up to\s+)?(\d+)\s+(?:martingale|Gale'?s?)", 
 
 def parse_signal(text: str, message_id: str | None = None) -> Signal | None:
     upper = text.upper()
+    
+    # Reject messages that are just martingale execution updates
+    # The bot handles martingales automatically based on the initial signal.
+    # If we parse these as new signals, the bot will join the martingale without the initial trade.
+    update_patterns = [
+        r"\b(?:1st|2nd|3rd|4th|5th|\d+th)\s+GALE\b",
+        r"\bGALE\s*(?:1|2|3|4|5)\b",
+        r"\bENTER(?:ING)?\s+GALE\b",
+        r"\bTIME\s+TO\s+GALE\b"
+    ]
+    for pattern in update_patterns:
+        if re.search(pattern, text, re.I):
+            return None
+            
     direction = None
     if re.search(r"\b(CALL)\b", upper):
         direction = Direction.UP
